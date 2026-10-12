@@ -1,0 +1,90 @@
+/**
+ * TikTok Video Downloader Module
+ *
+ * TikTok's own video URLs (what yt-dlp returns) are bound to the session
+ * cookie that requested them and answer 403 to anyone else, so they're no
+ * use to hand to the app. tikwm.com's public API returns no-watermark CDN
+ * URLs that do play outside the page. If it's down or rate-limiting us
+ * (free tier: 1 request/second), fall back to downloading the file onto
+ * this server with yt-dlp, which holds the right cookies itself.
+ */
+
+const fetch = require("node-fetch");
+const { DEFAULT_USER_AGENT } = require("./browser");
+const { normalizeUrl, DownloaderError } = require("./urlUtils");
+const { getInfo, muxToFile, toDownloaderError } = require("./ytdlp");
+
+const TIKWM_API = "https://www.tikwm.com/api/";
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchFromTikwm(url) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(`${TIKWM_API}?hd=1&url=${encodeURIComponent(url)}`, {
+      headers: { "User-Agent": DEFAULT_USER_AGENT, Accept: "application/json" },
+      timeout: 20000,
+    });
+    if (!response.ok) throw new Error(`tikwm request failed (${response.status}).`);
+    const body = await response.json();
+    if (body.code === 0 && body.data) return body.data;
+    if (attempt === 0 && /limit/i.test(body.msg || "")) {
+      await sleep(1200);
+      continue;
+    }
+    throw new Error(body.msg || "tikwm returned no data.");
+  }
+}
+
+/**
+ * Download TikTok video (or photo slideshow) from URL
+ * @param {string} url - TikTok video URL (full, vm.tiktok.com or vt.tiktok.com)
+ * @param {string} [baseUrl] - This server's base URL, for the yt-dlp fallback
+ * @returns {Promise<Object>} Video info with thumbnail and formats
+ */
+async function downloadTikTok(url, baseUrl = "") {
+  try {
+    url = normalizeUrl(url);
+
+    let data;
+    try {
+      data = await fetchFromTikwm(url);
+    } catch (apiError) {
+      console.warn("tikwm failed, falling back to yt-dlp:", apiError.message);
+    }
+
+    if (data) {
+      const formats = [];
+      if (data.hdplay) formats.push({ quality: "hd", videoUrl: data.hdplay });
+      if (data.play && data.play !== data.hdplay) formats.push({ quality: "sd", videoUrl: data.play });
+      // Photo slideshows have no video, just the images + the sound.
+      if (Array.isArray(data.images)) {
+        for (const image of data.images) formats.push({ quality: "image", videoUrl: image });
+      }
+      if (data.music) formats.push({ quality: "mp3", videoUrl: data.music });
+
+      if (formats.length) {
+        console.log(formats.map((f) => f.quality), `tiktok`);
+        return {
+          thumbnail: data.cover || data.origin_cover || null,
+          title: data.title || "TikTok video",
+          duration: data.duration || null,
+          formats,
+        };
+      }
+    }
+
+    const info = await getInfo(url);
+    const videoUrl = await muxToFile(info.webpage_url || url, baseUrl);
+    return {
+      thumbnail: info.thumbnail || null,
+      title: info.title || "TikTok video",
+      duration: info.duration || null,
+      formats: [{ quality: "hd", videoUrl }],
+    };
+  } catch (error) {
+    console.error("TikTok download error:", error.message);
+    if (error instanceof DownloaderError) throw error;
+    throw toDownloaderError(error);
+  }
+}
+
+module.exports = { downloadTikTok };
