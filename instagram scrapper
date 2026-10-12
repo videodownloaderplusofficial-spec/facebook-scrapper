@@ -1,0 +1,265 @@
+/**
+ * Instagram Video / Image Downloader Module
+ *
+ * Instagram reels/posts no longer reliably ship an `og:video` meta tag, and
+ * the `<video>` element's `src` is a `blob:` URL (MediaSource Extensions) —
+ * exactly the same trap as Pinterest's player, see pinterest.js. Both are
+ * useless outside the page.
+ *
+ * The real media lives in one of the `<script type="application/json"
+ * data-sjs>` blobs Instagram inlines for its own React hydration (Relay
+ * cache). Walking that JSON for the node whose `code` matches this URL's
+ * shortcode gives us `video_versions` (direct, unsigned-session .mp4 URLs,
+ * playable outside the page) and `image_versions2.candidates` (thumbnail).
+ * We match on `code` because a page can carry data for other posts too
+ * (related/timeline caches) and we only want *this* post's media.
+ *
+ * `blob:` / `data:` URLs are never returned.
+ *
+ * If the page scrape comes back empty (login wall, changed JSON shape) we
+ * retry once through yt-dlp, which talks to Instagram's API instead of the
+ * rendered page and so tends to fail on different links than the scrape.
+ */
+
+const { getBrowserInstance, DEFAULT_USER_AGENT } = require("./browser");
+const { normalizeUrl, DownloaderError } = require("./urlUtils");
+const { getInfo, mapFormats } = require("./ytdlp");
+
+const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateString(length) {
+  let result = " ";
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+}
+
+const isRealMediaUrl = (u) =>
+  typeof u === "string" && /^https?:\/\//i.test(u) && !/^blob:|^data:/i.test(u);
+
+/** Instagram video_versions[].type: 101 = original/best, higher isn't better. */
+const VIDEO_TYPE_RANK = { 101: 3, 102: 2, 103: 1 };
+const pickBestVideoVersion = (versions) =>
+  [...(versions || [])]
+    .filter((v) => v && isRealMediaUrl(v.url))
+    .sort((a, b) => (VIDEO_TYPE_RANK[b.type] || 0) - (VIDEO_TYPE_RANK[a.type] || 0))[0] || null;
+
+function extractShortcode(url) {
+  const m = url.match(/instagram\.com\/(?:[^/]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]+)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Walk the page's inline JSON (data-sjs script blobs) for the media node
+ * belonging to this post's shortcode.
+ */
+function findMediaNode(jsonBlobs, shortcode) {
+  let fallback = null;
+  for (const blob of jsonBlobs || []) {
+    if (!blob || (!blob.includes("video_versions") && !blob.includes("image_versions2"))) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(blob);
+    } catch (e) {
+      continue;
+    }
+    let match = null;
+    (function walk(node) {
+      if (match || !node || typeof node !== "object") return;
+      if (node.code && (node.video_versions || node.image_versions2)) {
+        if (!fallback) fallback = node;
+        if (shortcode && node.code === shortcode) {
+          match = node;
+          return;
+        }
+      }
+      for (const value of Object.values(node)) {
+        if (match) return;
+        if (value && typeof value === "object") walk(value);
+      }
+    })(parsed);
+    if (match) return match;
+  }
+  return fallback;
+}
+
+/** Same result shape as the page scrape, built from yt-dlp's metadata. */
+async function downloadViaYtDlp(url) {
+  const info = await getInfo(url);
+  const formats = mapFormats(info);
+  if (!formats.length) {
+    throw new DownloaderError("NO_MEDIA", "No media found on the Instagram page.");
+  }
+  const videoUrl = formats[0].videoUrl;
+  const thumbnail = info.thumbnail || videoUrl;
+  return {
+    status: "success",
+    message: "Media details successfully retrieved.",
+    data: { videoUrl, thumbnailUrl: thumbnail },
+    thumbnail,
+    title: info.title || generateString(25),
+    formats: [{ quality: "hd", videoUrl }],
+  };
+}
+
+/**
+ * Download Instagram media from URL
+ * @param {string} url - Instagram post/reel/IGTV URL
+ * @returns {Promise<Object>} { thumbnail, title, formats: [{ quality, videoUrl }] }
+ */
+async function downloadInstagram(url) {
+  try {
+    url = normalizeUrl(url);
+
+    if (/instagram\.com\/reels\/audio\//i.test(url)) {
+      throw new DownloaderError(
+        "UNSUPPORTED_URL",
+        "That link is an Instagram audio page, not a reel. Open one of the reels and share its link instead."
+      );
+    }
+    if (/instagram\.com\/(s|stories)\//i.test(url)) {
+      throw new DownloaderError(
+        "LOGIN_REQUIRED",
+        "Instagram stories and highlights are only visible to logged-in accounts."
+      );
+    }
+
+    try {
+      return await scrapeInstagramPage(url);
+    } catch (scrapeError) {
+      console.warn("Instagram page scrape failed, trying yt-dlp:", scrapeError.message);
+      try {
+        return await downloadViaYtDlp(url);
+      } catch (fallbackError) {
+        // A coded yt-dlp answer (login needed, removed) beats the scrape's guess.
+        throw fallbackError.code && fallbackError.code !== "EXTRACTION_FAILED"
+          ? fallbackError
+          : scrapeError;
+      }
+    }
+  } catch (error) {
+    console.error("Instagram download error:", error.message);
+    if (error instanceof DownloaderError) throw error;
+    throw new Error(`Failed to download Instagram video: ${error.message}`);
+  }
+}
+
+/** Scrape the rendered Instagram page with puppeteer. */
+async function scrapeInstagramPage(url) {
+  let page;
+  try {
+    const browser = await getBrowserInstance();
+    page = await browser.newPage();
+
+    await page.setViewport({ width: 1080, height: 1920 });
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+
+    // Last-resort net sniff, mirroring pinterest.js — Instagram serves large
+    // videos as byte-range chunks under the same URL, so a sniffed hit isn't
+    // guaranteed to be the whole file, but it beats nothing if the inline
+    // JSON shape below ever changes out from under us.
+    const sniffedMedia = new Set();
+    page.on("response", (response) => {
+      const u = response.url();
+      if (/\.mp4(\?|$)/i.test(u) && /cdninstagram\.com|fbcdn\.net/i.test(u)) sniffedMedia.add(u);
+    });
+
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
+
+    // The page is already network-idle here, so the tags are present if they
+    // are ever going to be; a long wait only delays the login-wall answer.
+    await page
+      .waitForSelector('meta[property="og:image"], meta[property="og:video"], video', {
+        timeout: 15000,
+      })
+      .catch(() => {});
+
+    const shortcode = extractShortcode(page.url()) || extractShortcode(url);
+
+    const details = await page.evaluate(() => {
+      const meta = (selector) => {
+        const content = document.querySelector(selector)?.getAttribute("content");
+        return content && content.trim() ? content.trim() : null;
+      };
+
+      const loginWall =
+        !!document.querySelector('input[name="username"]') &&
+        /log in|sign up/i.test(document.title || "");
+      const notFound = /sorry, this page isn't available|page not found/i.test(
+        document.body.innerText || ""
+      );
+
+      const ogVideo = meta('meta[property="og:video"]') || meta('meta[property="og:video:url"]');
+      const ogImage = meta('meta[property="og:image"]');
+      const title = meta('meta[property="og:title"]') || document.title || null;
+
+      const jsonBlobs = [
+        ...document.querySelectorAll('script[type="application/json"][data-sjs]'),
+      ].map((s) => s.textContent || "");
+
+      return { loginWall, notFound, ogVideo, ogImage, title, jsonBlobs };
+    });
+
+    if (details.notFound) {
+      throw new DownloaderError(
+        "CONTENT_UNAVAILABLE",
+        "Instagram could not find this post (it may be deleted or private)."
+      );
+    }
+    if (details.loginWall) {
+      throw new DownloaderError(
+        "LOGIN_REQUIRED",
+        "Instagram showed a login wall for this post instead of the media (this can happen for private accounts, or when Instagram is rate-limiting this server)."
+      );
+    }
+
+    const mediaNode = findMediaNode(details.jsonBlobs, shortcode);
+
+    const bestVideo = mediaNode ? pickBestVideoVersion(mediaNode.video_versions) : null;
+    const jsonThumb =
+      (mediaNode &&
+        mediaNode.image_versions2 &&
+        mediaNode.image_versions2.candidates &&
+        mediaNode.image_versions2.candidates[0] &&
+        mediaNode.image_versions2.candidates[0].url) ||
+      null;
+
+    let videoUrl =
+      (bestVideo && bestVideo.url) ||
+      (isRealMediaUrl(details.ogVideo) ? details.ogVideo : null) ||
+      [...sniffedMedia][0] ||
+      null;
+
+    const thumbnail = jsonThumb || details.ogImage || null;
+
+    console.log(
+      { shortcode, hasMediaNode: !!mediaNode, videoUrl: !!videoUrl, sniffed: sniffedMedia.size },
+      `instagram`
+    );
+
+    if (!videoUrl && !thumbnail) {
+      throw new DownloaderError("NO_MEDIA", "No media found on the Instagram page.");
+    }
+
+    const finalMedia = videoUrl || thumbnail;
+    const finalThumb = thumbnail || videoUrl;
+
+    return {
+      // Legacy shape (kept for existing callers of this endpoint).
+      status: "success",
+      message: "Media details successfully retrieved.",
+      data: { videoUrl: finalMedia, thumbnailUrl: finalThumb },
+      // Shape shared with the other downloaders (pinterest/capcut/dailymotion).
+      thumbnail: finalThumb,
+      title: details.title || generateString(25),
+      formats: [{ quality: videoUrl ? "hd" : "image", videoUrl: finalMedia }],
+    };
+  } finally {
+    if (page) {
+      await page.close();
+    }
+  }
+}
+
+module.exports = { downloadInstagram };
