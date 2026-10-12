@@ -1,0 +1,106 @@
+/**
+ * CapCut Template Video Downloader Module
+ *
+ * CapCut template share pages (capcut.com/t/..., capcut.com/template-detail/...)
+ * are JS-rendered. We render the page with the shared Puppeteer instance and
+ * read the direct preview .mp4 out of the og:video meta tag (with a raw-HTML
+ * regex fallback for the embedded player config), so the caller gets a
+ * playable URL instead of the CapCut landing page.
+ */
+
+const { getBrowserInstance, DEFAULT_USER_AGENT } = require("./browser");
+
+const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateString(length) {
+  let result = " ";
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+}
+
+/**
+ * Download CapCut template video from URL using puppeteer scraping
+ * @param {string} url - CapCut template URL
+ * @returns {Promise<Object>} Video info with thumbnail and formats
+ */
+async function downloadCapcut(url) {
+  let page;
+  try {
+    const browser = await getBrowserInstance();
+    page = await browser.newPage();
+
+    await page.setViewport({ width: 1080, height: 1920 });
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
+
+    await page
+      .waitForSelector('meta[property="og:video"], meta[property="og:image"], video', {
+        timeout: 60000,
+      })
+      .catch(() => {});
+
+    const details = await page.evaluate(() => {
+      const meta = (selector) => {
+        const content = document.querySelector(selector)?.getAttribute("content");
+        return content && content.trim() ? content.trim() : null;
+      };
+
+      let videoUrl =
+        meta('meta[property="og:video"]') ||
+        meta('meta[property="og:video:url"]') ||
+        meta('meta[property="og:video:secure_url"]') ||
+        meta('meta[name="twitter:player:stream"]');
+
+      const thumbnail =
+        meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]');
+      const title =
+        meta('meta[property="og:title"]') || document.title || null;
+
+      if (!videoUrl) {
+        const videoEl = document.querySelector("video");
+        if (videoEl) {
+          videoUrl =
+            videoEl.getAttribute("src") ||
+            videoEl.querySelector("source")?.getAttribute("src") ||
+            null;
+        }
+      }
+
+      // Fallback: dig a direct .mp4 out of the inlined player/page config.
+      if (!videoUrl) {
+        const match = document.documentElement.innerHTML.match(
+          /https?:(?:\\?\/){2}[^"'\s\\]+?\.mp4[^"'\s\\]*/i
+        );
+        if (match) {
+          videoUrl = match[0].replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+        }
+      }
+
+      return { videoUrl, thumbnail, title };
+    });
+
+    console.log(details, `capcut`);
+
+    if (!details.videoUrl) {
+      throw new Error("No video URL found on the CapCut page.");
+    }
+
+    return {
+      thumbnail: details.thumbnail || null,
+      title: details.title || generateString(25),
+      formats: [{ quality: "720p", videoUrl: details.videoUrl }],
+    };
+  } catch (error) {
+    console.error("CapCut download error:", error.message);
+    throw new Error(`Failed to download CapCut video: ${error.message}`);
+  } finally {
+    if (page) {
+      await page.close();
+    }
+  }
+}
+
+module.exports = { downloadCapcut };
