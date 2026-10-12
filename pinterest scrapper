@@ -1,0 +1,345 @@
+/**
+ * Pinterest Video / Image Downloader Module
+ *
+ * Pinterest pin pages (and pin.it short links) are JS-rendered. Two gotchas:
+ *
+ *  - The <video> element uses MediaSource Extensions, so its `src` is a
+ *    useless `blob:` URL, and newer video pins are served HLS-only
+ *    (a `.m3u8` under `/videos/iht/hls/...`) with no `.mp4` on the page.
+ *  - A pin closeup page also renders a "More like this" grid whose pins
+ *    autoplay, so blindly sniffing the first video you see gives you a
+ *    *different* pin's video.
+ *
+ * So we first decide whether *this* pin is a video at all (Pinterest's own
+ * PinResource JSON API for the pin, or og:video, or a schema.org VideoObject
+ * in the page's ld+json, or a `video_list` in the page-state JSON). Only then
+ * do we resolve a real media URL:
+ *   1. `video_list` from the PinResource API (called from inside the loaded
+ *      pinterest.com page so it carries the browser fingerprint/cookies) —
+ *      this is the only source that survives the live datacenter IP, where
+ *      the autoplay sniff / page-state paths silently degrade to the image,
+ *   2. direct `.mp4` / `.m3u8` from og:video / ld+json / page-state JSON,
+ *   3. else the `.m3u8` Pinterest's own player requested (network sniff),
+ *   4. and if all we have is HLS, derive the progressive `.mp4` Pinterest
+ *      keeps for the same asset and verify it with a HEAD request.
+ * Otherwise it's an image pin and we return the image.
+ *
+ * `blob:` / `data:` URLs are never returned.
+ */
+
+const fetch = require("node-fetch");
+const { getBrowserInstance, DEFAULT_USER_AGENT } = require("./browser");
+
+const PINTEREST_REFERER = "https://www.pinterest.com/";
+
+const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateString(length) {
+  let result = " ";
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+}
+
+const isRealMediaUrl = (u) =>
+  typeof u === "string" && /^https?:\/\//i.test(u) && !/^blob:|^data:/i.test(u);
+
+const isMp4 = (u) => /\.mp4(\?|$)/i.test(u);
+const isHls = (u) => /\.m3u8(\?|$)/i.test(u);
+
+const scoreMediaUrl = (u) => {
+  let score = 0;
+  if (isMp4(u)) score += 1000;
+  else if (isHls(u)) score += 500;
+  const res = u.match(/(\d{3,4})(?:p|w)\b/i);
+  if (res) score += Number(res[1]);
+  return score;
+};
+
+const pickBestMedia = (urls) =>
+  [...urls].filter(isRealMediaUrl).sort((a, b) => scoreMediaUrl(b) - scoreMediaUrl(a))[0] ||
+  null;
+
+/** Walk parsed JSON looking for Pinterest `video_list` objects. */
+function collectVideoListUrls(node, found) {
+  if (!node || typeof node !== "object") return;
+  if (node.video_list && typeof node.video_list === "object") {
+    for (const variant of Object.values(node.video_list)) {
+      if (variant && typeof variant.url === "string") found.add(variant.url);
+    }
+  }
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") collectVideoListUrls(value, found);
+  }
+}
+
+/** Pull contentUrl/embedUrl out of any schema.org VideoObject in ld+json. */
+function videoUrlFromLdJson(blobs) {
+  for (const blob of blobs || []) {
+    let parsed;
+    try {
+      parsed = JSON.parse(blob);
+    } catch (e) {
+      continue;
+    }
+    const nodes = Array.isArray(parsed) ? parsed : [parsed];
+    for (const node of nodes) {
+      const types = [].concat(node["@type"] || []);
+      const isVideo =
+        types.includes("VideoObject") ||
+        (node.video && typeof node.video === "object");
+      const source = node.video && typeof node.video === "object" ? node.video : node;
+      const url = source.contentUrl || source.embedUrl;
+      if (isVideo && isRealMediaUrl(url)) return url;
+    }
+  }
+  return null;
+}
+
+/**
+ * Ask Pinterest's own unauth JSON endpoint for the pin's media, running the
+ * request *inside the already-loaded pinterest.com page* so it carries the
+ * browser's fingerprint/cookies (a bare node-fetch to this endpoint gets the
+ * connection reset). This returns the pin's `video_list` (real .mp4 / .m3u8
+ * URLs) directly, so it doesn't depend on the pin autoplaying — which is the
+ * part that silently degrades to just the image on datacenter IPs.
+ *
+ * @returns {Promise<{videoUrls: string[], thumbnail: string|null, title: string|null}|null>}
+ */
+async function fetchPinDataViaApi(page, pinId) {
+  try {
+    const data = await page.evaluate(async (id) => {
+      const api = new URL("https://www.pinterest.com/resource/PinResource/get/");
+      api.searchParams.set("source_url", "/pin/" + id + "/");
+      // "detailed" is the field set that actually carries `video_list`;
+      // "unauth_react" omits it for many video/idea pins.
+      api.searchParams.set(
+        "data",
+        JSON.stringify({
+          options: { id: id, field_set_key: "detailed", noCache: true },
+          context: {},
+        })
+      );
+      api.searchParams.set("_", String(Date.now()));
+      const res = await fetch(api.toString(), {
+        headers: {
+          Accept: "application/json, text/javascript, */*, q=0.01",
+          "X-Requested-With": "XMLHttpRequest",
+          "X-Pinterest-PWS-Handler": "www/pin/[id].js",
+        },
+        credentials: "include",
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      return (json && json.resource_response && json.resource_response.data) || null;
+    }, pinId);
+
+    if (!data || typeof data !== "object") return null;
+
+    const videoUrls = new Set();
+    collectVideoListUrls(data, videoUrls);
+
+    const thumbnail =
+      (data.images &&
+        ((data.images.orig && data.images.orig.url) ||
+          (data.images["736x"] && data.images["736x"].url) ||
+          (data.images["600x"] && data.images["600x"].url))) ||
+      null;
+    const title =
+      (data.title && data.title.trim()) ||
+      (data.grid_title && data.grid_title.trim()) ||
+      (data.seo_title && data.seo_title.trim()) ||
+      null;
+
+    return { videoUrls: [...videoUrls], thumbnail, title };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function urlServesVideo(url) {
+  try {
+    const res = await fetch(url, {
+      method: "HEAD",
+      headers: { "User-Agent": DEFAULT_USER_AGENT, Referer: PINTEREST_REFERER },
+    });
+    return res.ok && (res.headers.get("content-type") || "").toLowerCase().includes("video");
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Given an HLS URL like
+ *   https://v1.pinimg.com/videos/iht/hls/4c/03/49/<hash>[_720w].m3u8
+ * try the progressive-mp4 copies Pinterest keeps for the same asset and
+ * return the first that actually serves video/mp4.
+ */
+async function deriveMp4FromHls(hlsUrl) {
+  const m = hlsUrl.match(/\/videos\/[^?]*?\/((?:[0-9a-f]{2}\/){3})([0-9a-f]{32})/i);
+  if (!m) return null;
+  const dir = m[1];
+  const hash = m[2];
+  const candidates = [
+    `https://v1.pinimg.com/videos/mc/720p/${dir}${hash}.mp4`,
+    `https://v1.pinimg.com/videos/iht/720p/${dir}${hash}.mp4`,
+    `https://v1.pinimg.com/videos/mc/480p/${dir}${hash}.mp4`,
+    `https://v1.pinimg.com/videos/mc/720p/${dir}${hash}_720w.mp4`,
+  ];
+  for (const candidate of candidates) {
+    if (await urlServesVideo(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Download Pinterest media from URL using puppeteer scraping
+ * @param {string} url - Pinterest pin URL or pin.it short link
+ * @returns {Promise<Object>} { thumbnail, title, formats: [{ quality, videoUrl }] }
+ */
+async function downloadPinterest(url) {
+  let page;
+  try {
+    const browser = await getBrowserInstance();
+    page = await browser.newPage();
+
+    await page.setViewport({ width: 1080, height: 1920 });
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+
+    const sniffedMedia = new Set();
+    page.on("response", (response) => {
+      const u = response.url();
+      if (isHls(u) || isMp4(u)) sniffedMedia.add(u);
+    });
+
+    // pin.it short links 3xx-redirect to the real pin; puppeteer follows it.
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
+
+    await page
+      .waitForSelector('meta[property="og:image"], meta[property="og:video"], video', {
+        timeout: 60000,
+      })
+      .catch(() => {});
+
+    // --- Primary media resolution: Pinterest's own JSON API, called from
+    // inside this page. It returns the pin's video_list directly, so unlike
+    // the og:video / autoplay-sniff heuristics below it doesn't depend on the
+    // pin actually playing — which is what breaks on the live (datacenter) IP.
+    const pinId = (page.url().match(/\/pin\/(\d+)/) || [])[1] || null;
+    let apiData = null;
+    if (pinId) {
+      apiData = await fetchPinDataViaApi(page, pinId);
+    }
+
+    const details = await page.evaluate(() => {
+      const meta = (selector) => {
+        const content = document.querySelector(selector)?.getAttribute("content");
+        return content && content.trim() ? content.trim() : null;
+      };
+
+      const notFound = /can't find that idea|couldn't find that|page not found/i.test(
+        document.body.innerText || ""
+      );
+
+      const ogVideo =
+        meta('meta[property="og:video"]') ||
+        meta('meta[property="og:video:url"]') ||
+        meta('meta[property="og:video:secure_url"]');
+      const ogImage =
+        meta('meta[property="og:image"]') || meta('meta[name="twitter:image"]');
+      const title = meta('meta[property="og:title"]') || document.title || null;
+
+      const ldJson = [...document.querySelectorAll('script[type="application/ld+json"]')].map(
+        (s) => s.textContent || ""
+      );
+
+      const stateIds = ["__PWS_DATA__", "initial-state", "__PWS_INITIAL_PROPS__", "__NEXT_DATA__"];
+      const stateBlobs = [];
+      for (const id of stateIds) {
+        const el = document.getElementById(id);
+        if (el && el.textContent) stateBlobs.push(el.textContent);
+      }
+
+      return { notFound, ogVideo, ogImage, title, ldJson, stateBlobs };
+    });
+
+    if (details.notFound) {
+      throw new Error("Pinterest could not find this pin (it may be deleted or private).");
+    }
+
+    // --- direct media URLs that belong to THIS pin ---
+    const stateUrls = new Set();
+    for (const blob of details.stateBlobs || []) {
+      try {
+        collectVideoListUrls(JSON.parse(blob), stateUrls);
+      } catch (e) {
+        // ignore non-JSON blobs here; ld+json / og:video / sniff cover us
+      }
+    }
+    const ldVideo = videoUrlFromLdJson(details.ldJson);
+    const apiVideoUrls = (apiData && apiData.videoUrls) || [];
+
+    // Is this pin a video at all?
+    const pinIsVideo =
+      apiVideoUrls.length > 0 ||
+      isRealMediaUrl(details.ogVideo) ||
+      Boolean(ldVideo) ||
+      stateUrls.size > 0;
+
+    let videoUrl = null;
+    if (pinIsVideo) {
+      videoUrl =
+        pickBestMedia([
+          ...apiVideoUrls, // Pinterest's own API answer for THIS pin wins
+          ...(isRealMediaUrl(details.ogVideo) ? [details.ogVideo] : []),
+          ...(ldVideo ? [ldVideo] : []),
+          ...stateUrls,
+        ]) || pickBestMedia(sniffedMedia); // sniff only as a last resort
+
+      if (videoUrl && isHls(videoUrl)) {
+        const mp4 = await deriveMp4FromHls(videoUrl);
+        if (mp4) videoUrl = mp4;
+      }
+    }
+
+    const thumbnail = details.ogImage || (apiData && apiData.thumbnail) || null;
+    const title = details.title || (apiData && apiData.title) || null;
+
+    console.log(
+      {
+        pinIsVideo,
+        videoUrl,
+        api: apiVideoUrls.length,
+        sniffed: sniffedMedia.size,
+        state: stateUrls.size,
+        ld: Boolean(ldVideo),
+      },
+      `pinterest`
+    );
+
+    if (!videoUrl && !thumbnail) {
+      throw new Error("No media found on the Pinterest page.");
+    }
+
+    return {
+      thumbnail,
+      title: title || generateString(25),
+      formats: [
+        {
+          quality: videoUrl ? (isHls(videoUrl) ? "hls" : "720p") : "image",
+          videoUrl: videoUrl || thumbnail,
+        },
+      ],
+    };
+  } catch (error) {
+    console.error("Pinterest download error:", error.message);
+    throw new Error(`Failed to download Pinterest media: ${error.message}`);
+  } finally {
+    if (page) {
+      await page.close();
+    }
+  }
+}
+
+module.exports = { downloadPinterest };
