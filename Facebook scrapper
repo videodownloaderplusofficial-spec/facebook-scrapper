@@ -1,0 +1,228 @@
+/**
+ * Facebook Video Downloader Module
+ *
+ * Three attempts, cheapest first:
+ *  1. Fetch the page ourselves (following facebook.com/share/... and
+ *     fb.watch redirects to the real reel/video URL) and read the video
+ *     URLs out of the inlined player JSON.
+ *  2. fb-downloader-scrapper on the resolved URL — it sends different
+ *     headers, which occasionally gets a page variant that attempt 1 didn't.
+ *  3. Render the page in Puppeteer. This rarely finds a video the first two
+ *     missed; its real job is to read *why* Facebook withheld it (18+ login
+ *     gate, deleted, private) so the caller gets that reason instead of a
+ *     generic failure.
+ *
+ * Set FACEBOOK_COOKIE (a logged-in session's Cookie header) to reach
+ * login-gated videos; without it only public videos are downloadable.
+ */
+
+const fetch = require("node-fetch");
+const getFbVideoInfo = require("fb-downloader-scrapper");
+const { getBrowserInstance, DEFAULT_USER_AGENT } = require("./browser");
+const { normalizeUrl, DownloaderError } = require("./urlUtils");
+
+/**
+ * Generate random string for fallback title
+ */
+const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateString(length) {
+  let result = " ";
+  const charactersLength = characters.length;
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * charactersLength));
+  }
+  return result;
+}
+
+const PAGE_HEADERS = {
+  "User-Agent": DEFAULT_USER_AGENT,
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+  "Upgrade-Insecure-Requests": "1",
+};
+
+/** Decode a JSON string literal's contents (\/ and \uXXXX escapes). */
+function parseString(value) {
+  try {
+    return JSON.parse(`"${value}"`);
+  } catch (e) {
+    return value.replace(/\\\//g, "/");
+  }
+}
+
+const firstMatch = (html, patterns) => {
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match && match[1]) return parseString(match[1]);
+  }
+  return null;
+};
+
+const progressiveUrl = (html, quality) =>
+  new RegExp(
+    `"progressive_url":"([^"]+)","failure_reason":null,"metadata":\\{"quality":"${quality}"\\}`
+  );
+
+/** Read the player's direct .mp4 URLs out of a Facebook page's HTML. */
+function parseVideoFromHtml(rawHtml) {
+  const html = rawHtml.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+
+  const sd = firstMatch(html, [
+    /"browser_native_sd_url":"([^"]+)"/,
+    progressiveUrl(html, "SD"),
+    /"playable_url":"([^"]+)"/,
+    /sd_src\s*:\s*"([^"]+)"/,
+  ]);
+  const hd = firstMatch(html, [
+    /"browser_native_hd_url":"([^"]+)"/,
+    progressiveUrl(html, "HD"),
+    /"playable_url_quality_hd":"([^"]+)"/,
+    /hd_src\s*:\s*"([^"]+)"/,
+  ]);
+  if (!sd && !hd) return null;
+
+  const duration = html.match(/"playable_duration_in_ms":(\d+)/);
+  return {
+    sd,
+    hd,
+    thumbnail: firstMatch(html, [
+      /"preferred_thumbnail":\{"image":\{"uri":"([^"]+)"/,
+      /<meta\s+property="og:image"\s+content="([^"]+)"/,
+    ]),
+    title: firstMatch(html, [
+      /<meta\s+property="og:title"\s+content="([^"]+)"/,
+      /<meta\s+name="description"\s+content="([^"]+)"/,
+      /<title>([^<]+)<\/title>/,
+    ]),
+    duration: duration ? Math.round(Number(duration[1]) / 1000) : null,
+  };
+}
+
+/** Turn the text Facebook shows instead of the video into an error. */
+function explainMissingVideo(pageText, pageUrl) {
+  if (/log in to view this 18\+|inappropriate for people under 18/i.test(pageText)) {
+    return new DownloaderError(
+      "LOGIN_REQUIRED",
+      "Facebook marks this video as 18+ and only shows it to logged-in accounts."
+    );
+  }
+  if (/no longer available|link may be broken|may have been removed/i.test(pageText)) {
+    return new DownloaderError(
+      "CONTENT_UNAVAILABLE",
+      "This Facebook video is no longer available (it was removed or the link is broken)."
+    );
+  }
+  if (/content isn't available|only shared it with a small group/i.test(pageText)) {
+    return new DownloaderError(
+      "CONTENT_UNAVAILABLE",
+      "This Facebook post is private or has been deleted."
+    );
+  }
+  if (/\/stories\//i.test(pageUrl)) {
+    return new DownloaderError(
+      "LOGIN_REQUIRED",
+      "Facebook stories are only visible to logged-in accounts."
+    );
+  }
+  if (/page isn't available at the moment/i.test(pageText)) {
+    // Despite the wording this isn't a temporary glitch: it's what logged-out
+    // visitors get for audience/region-restricted reels, on every page variant.
+    return new DownloaderError(
+      "CONTENT_UNAVAILABLE",
+      "Facebook doesn't show this video without a login (restricted audience or region), or it has been removed."
+    );
+  }
+  if (/\/(posts|photo|photos)\/|[?&]story_fbid=/i.test(pageUrl)) {
+    return new DownloaderError("NO_MEDIA", "This Facebook post doesn't contain a video.");
+  }
+  return new DownloaderError(
+    "NO_MEDIA",
+    "No public video found at this Facebook link (it may be private or need a login)."
+  );
+}
+
+async function fetchPage(url) {
+  const headers = { ...PAGE_HEADERS };
+  if (process.env.FACEBOOK_COOKIE) headers.Cookie = process.env.FACEBOOK_COOKIE;
+  const response = await fetch(url, { headers, redirect: "follow", timeout: 30000 });
+  return { finalUrl: response.url || url, html: await response.text() };
+}
+
+async function renderPage(url) {
+  let page;
+  try {
+    const browser = await getBrowserInstance();
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.setUserAgent(DEFAULT_USER_AGENT);
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 }).catch(() => {});
+    return {
+      html: await page.content(),
+      text: await page.evaluate(() => document.body.innerText || ""),
+    };
+  } finally {
+    if (page) {
+      await page.close();
+    }
+  }
+}
+
+/**
+ * Download Facebook video from URL
+ * @param {string} url - Facebook video URL
+ * @returns {Promise<Object>} Video info with thumbnail and formats
+ */
+async function downloadFacebook(url) {
+  try {
+    url = normalizeUrl(url);
+
+    let finalUrl = url;
+    let videoInfo = null;
+
+    try {
+      const page = await fetchPage(url);
+      finalUrl = page.finalUrl;
+      videoInfo = parseVideoFromHtml(page.html);
+    } catch (fetchError) {
+      console.warn("Facebook page fetch failed:", fetchError.message);
+    }
+
+    if (!videoInfo) {
+      try {
+        videoInfo = await getFbVideoInfo(finalUrl);
+      } catch (libraryError) {
+        // Rejects with a generic string whatever the cause; attempt 3 finds the real one.
+      }
+    }
+
+    if (!videoInfo || (!videoInfo.sd && !videoInfo.hd)) {
+      const rendered = await renderPage(finalUrl);
+      videoInfo = parseVideoFromHtml(rendered.html);
+      // Both URLs: a story link redirects to a login page that no longer says "stories".
+      if (!videoInfo) throw explainMissingVideo(rendered.text, `${url} ${finalUrl}`);
+    }
+
+    console.log({ finalUrl, sd: !!videoInfo.sd, hd: !!videoInfo.hd }, `facebook`);
+
+    return {
+      thumbnail: videoInfo.thumbnail || null,
+      formats: [
+        { videoUrl: videoInfo.sd || videoInfo.hd, quality: "360p" },
+        { videoUrl: videoInfo.hd || videoInfo.sd, quality: "720p" },
+      ],
+      title: videoInfo.title || generateString(25),
+      duration: videoInfo.duration || null,
+    };
+  } catch (error) {
+    console.error("Facebook download error:", error.message);
+    if (error instanceof DownloaderError) throw error;
+    throw new Error(`Failed to download Facebook video: ${error.message}`);
+  }
+}
+
+module.exports = { downloadFacebook };
